@@ -49,3 +49,5 @@ coverage/
 
 # Docs
 SecureCalculator_CodebaseGuide_v1.1.0.docx
+
+*.zip
