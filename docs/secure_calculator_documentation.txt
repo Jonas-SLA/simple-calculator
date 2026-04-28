@@ -1,0 +1,114 @@
+# System Documentation: Secure Full-Stack Calculator
+
+## 1. High-Level Overview
+This application is a secure, web-based calculator that strictly separates the user interface from the calculation logic. Its primary purpose is to provide basic arithmetic capabilities while demonstrating a production-grade, zero-trust architecture.
+
+The system is designed with a "dumb client, authoritative server" model. This architecture was chosen to completely isolate mathematical evaluation from the browser. By treating all client input as potentially malicious, the application prevents common web vulnerabilities (like arbitrary code execution and injection) while ensuring the calculation engine remains secure, scalable, and entirely hidden from the end-user.
+
+## 2. System Architecture
+The application is decoupled into two distinct environments communicating via a RESTful HTTP API.
+
+* Backend (Logic & Security Layer): The sole authority on calculations. It acts as an API server that receives strings, validates them against strict rules, computes the result, and returns it. It is heavily fortified against malicious payloads and traffic abuse.
+* Frontend (Interaction Layer): Responsible only for state management of the UI. It captures keystrokes/clicks, constructs an unverified string expression, and acts as an HTTP client to query the backend.
+* HTML (Structure): Defines the visual grid and semantic layout of the calculator display and keypad. No inline scripts or logic.
+* CSS (Styling): Manages responsiveness, button states (hover, disabled), and the overall visual theme.
+* Component Communication: The frontend sends a POST request containing a JSON payload with the mathematical expression. The backend replies with a JSON payload containing either the computed numerical result or a sanitized error message.
+
+## 3. Backend Breakdown
+The backend is built using Node.js and Express.js, heavily relying on middleware for security and request parsing.
+
+### Folder/File Structure
+* routes/api.js: Defines the API endpoints and chains the appropriate middleware and controller for each route.
+* controllers/calcController.js: The HTTP interface. It extracts the validated request body, delegates the mathematical operation to the service layer, formats the response, and manages HTTP status codes (200 for success, 422 for unprocessable entities). It also logs raw errors server-side without leaking them to the client.
+* services/calcService.js: The core logic engine. It utilizes the mathjs library to safely parse and evaluate the mathematical string. It includes custom safeguards against non-number result types, Infinity (e.g., division by zero), and NaN results. The original error message is preserved and logged before throwing a sanitized version to the controller.
+* middlewares/validator.js: The gatekeeper. It uses Joi to enforce a strict allowlist schema before the controller is ever reached.
+
+### API Design
+* Endpoint: POST /api/calculate
+* Request Format: application/json -> { "expression": "string" }
+* Success Response: 200 OK -> { "result": number }
+* Error Response: 400/422/500 -> { "error": "string", "message": "string" }
+
+### Security Mechanisms Implementations
+* Input Validation: The validator middleware enforces a strict Regex pattern (/^[0-9+\-*/().\s]+$/) allowing only numbers and basic mathematical operators. It also enforces a strict character length limit (100 characters) to prevent Regular Expression Denial of Service (ReDoS) and memory exhaustion.
+* Rate Limiting: express-rate-limit is globally applied to API routes to restrict the number of requests per IP within a given time window, preventing brute-force and DoS attacks.
+* Secure Headers: The helmet package is used to set secure HTTP headers, protecting against cross-site scripting (XSS) and clickjacking.
+* Payload Limits: express.json({ limit: '10kb' }) prevents massive payload attacks.
+* Error Handling: Global and controller-level error handlers ensure that the Node process never crashes from unhandled exceptions. Stack traces are logged to the server console but are entirely stripped from the JSON response sent to the client.
+* CORS Production Warning: On startup, the server logs a console warning if NODE_ENV is set to 'production' and CORS_ORIGIN is still set to '*', prompting the operator to lock it down to the actual frontend domain.
+
+## 4. Frontend Breakdown
+The frontend utilizes Vanilla JavaScript, avoiding heavy frameworks to maintain simplicity.
+
+* User Interaction: An event delegation pattern is attached to the calculator buttons. It listens for clicks, differentiates between numbers, operators, the "clear" action, the "backspace" action, and the "calculate" action using HTML data- attributes.
+* Backspace Support: A backspace button (data-action="backspace") removes the last character from the current expression string, allowing the user to correct individual digits without clearing the entire input.
+* Request Generation: Upon hitting "equals", the app disables the keypad, shows a loading state, and utilizes the fetch API to send the built string state to the backend endpoint.
+* Response Handling: It awaits the JSON response. If successful, it replaces the current display state with the result. If an error occurs (or a non-200 status is returned), it triggers a temporary UI error toast and reverts the display to the user's original input.
+* Intentional Logic Omission: There is absolutely no mathematical calculation (+, -), string evaluation (eval()), or complex validation performed in the browser.
+
+## 5. Data Flow (Step-by-Step)
+1. Interaction: The user clicks buttons to form an expression (e.g., 8, /, 2).
+2. State Construction: The frontend JavaScript concatenates these clicks into a single string: "8/2".
+3. Submission: The user clicks =. The frontend locks the UI and sends an HTTP POST request: {"expression": "8/2"}.
+4. Ingestion & Security Check: The backend receives the request. The rate limiter registers the hit. The JSON parser checks the payload size. The CORS policy ensures the origin is authorized.
+5. Validation: The Joi middleware checks the string "8/2". It confirms it contains only allowed characters and is under 100 characters long. It passes.
+6. Processing: The controller hands "8/2" to the calcService. The mathjs engine safely evaluates the string and returns 4. The service also verifies the result is of type 'number' before returning it.
+7. Response: The controller wraps the output and sends HTTP 200: {"result": 4}.
+8. UI Update: The frontend receives the payload, unlocks the UI, and updates the calculator display to show 4.
+
+## 6. Key Design Decisions
+* Backend as Authoritative Engine: A compromised frontend (e.g., via browser dev tools) cannot manipulate the calculation outcome or access the underlying logic. 
+* Zero Use of eval(): eval() executes arbitrary strings as code, leading to critical security vulnerabilities. mathjs is used instead as it implements a safe, sandboxed expression parser.
+* Strict Separation of Concerns: By completely decoupling the UI from the logic, the backend can be repurposed for mobile apps or third-party API consumers without rewriting the calculation logic.
+* Security-First Design: The system assumes all incoming data is hostile. The allowlist approach (defining exactly what is allowed) is preferred over a blocklist approach (trying to guess what isn't allowed).
+
+## 7. Security Considerations
+* Considered Threats: Arbitrary Code Execution (ACE), Cross-Site Scripting (XSS), Denial of Service (DoS), and Server-Side Request Forgery (SSRF).
+* Mitigations: ACE is prevented by avoiding eval. XSS payloads are inherently blocked by the Joi Regex allowlist (which rejects letters and script tags). DoS is mitigated by payload size limits and rate limiting.
+* Assumptions: The documentation assumes the backend will be deployed behind a secure reverse proxy (like NGINX) with SSL/TLS (HTTPS) termination, and that environment variables (like CORS_ORIGIN) are strictly configured in production. A startup warning is emitted if CORS_ORIGIN is left as '*' in a production environment.
+
+## 8. Limitations and Edge Cases
+* Known Constraints: Only basic operators (+, -, *, /, parentheses) are permitted. Exponents, square roots, and trigonometric functions are currently blocked by the strict Regex.
+* Input Limits: Expressions cannot exceed 100 characters.
+* Failure Scenarios: Mathematical edge cases like division by zero or malformed syntax (e.g., 2 + + 2) are caught by the mathjs parser or the service layer, resulting in a controlled 422 Unprocessable Entity error rather than a server crash.
+
+## 9. How to Extend the System
+* Adding New Operations: 
+    1. Add the new button to index.html with an appropriate data-value or data-action attribute.
+    2. Update the regex pattern in middlewares/validator.js to permit the new operator character or mathematical string (e.g., allow letters if adding sin()).
+    3. Update services/calcService.js if the new operation requires custom handling beyond standard mathjs capabilities.
+* Improving Validation: Complex validation rules (like preventing consecutive operators) can be added to the Joi schema or handled via custom middleware logic.
+* Scaling the Backend: The Express backend is entirely stateless. It can be containerized (Docker) and scaled horizontally across multiple instances behind a load balancer without any session management issues.
+* Adding Authentication: Insert an authentication middleware (e.g., validating a JWT in the Authorization header) into routes/api.js before the validateExpression middleware.
+
+## 10. Setup and Execution
+* Backend Setup: 
+    1. Navigate to the backend directory.
+    2. Run 'npm install' to grab dependencies (includes nodemon as a dev dependency).
+    3. Create a .env file based on provided configurations (set PORT and CORS_ORIGIN).
+    4. Run 'npm start' to initialize the Express server (production), or 'npm run dev' for development mode with hot-reload via nodemon.
+* Frontend Setup: 
+    1. Ensure the API_URL variable in app.js points to the running backend (e.g., http://localhost:3000/api/calculate).
+    2. Add a backspace button to index.html with data-action="backspace" in the button grid if one is not already present.
+    3. Serve the frontend directory using any standard static web server (like VS Code Live Server, Python http.server, or NGINX). Opening the HTML file directly in the browser via file:// protocol may cause CORS issues depending on the browser.
+
+---
+
+## 11. Update Log
+
+### v1.1.0 — 2026-04-22
+
+#### [Fix] CORS Wildcard Production Warning (backend/server.js)
+Added a startup check that emits a console warning when NODE_ENV is 'production' and CORS_ORIGIN is set to '*' (the default). Previously the default configuration was silently insecure; operators could deploy to production without realising the CORS policy was wide open. The warning makes the misconfiguration visible immediately on server start without breaking existing development workflows.
+
+#### [Fix] Error Swallowing in CalcService (backend/services/calcService.js)
+The inner try/catch previously discarded the original mathjs error before re-throwing a generic message. Since the controller logs error.message, every calculation failure produced the same uninformative log entry: "Failed to evaluate expression". The original error is now logged at the service layer via console.error before the sanitised error is thrown, preserving useful debugging context without leaking internal details to the client.
+
+#### [Fix] Non-Number Result Type Guard (backend/services/calcService.js)
+Added a typeof result !== 'number' check before the existing Infinity and NaN guards. mathjs.evaluate() can return non-primitive types (e.g., Unit, Complex, Matrix) for certain valid-but-unsupported inputs that pass the regex allowlist. This guard catches those cases and throws a controlled error rather than returning an unexpected object to the client.
+
+#### [Fix] Backspace Support (frontend/app.js)
+Added handling for data-action="backspace" in the button event listener. The action removes the last character from currentExpression via String.prototype.slice(0, -1) and refreshes the display. Previously the only way to correct a mistyped entry was to clear the entire expression, which was a UX gap. To activate this feature, add a button with data-action="backspace" to index.html.
+
+#### [Improvement] Development Script — nodemon (backend/package.json)
+Added nodemon as a dev dependency and a "dev": "nodemon server.js" script to package.json. The existing "start" script is unchanged. Run 'npm run dev' during development for automatic server restarts on file changes.
